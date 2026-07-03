@@ -142,7 +142,7 @@ function App() {
                 />
               </label>
               {error && <p className="error">{error}</p>}
-              <button type="submit">Login</button>
+             
             </form>
             <p className="switch-text">
               Don&apos;t have an account?{" "}
