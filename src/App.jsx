@@ -18,6 +18,7 @@ function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [error, setError] = useState("");
   const [loginForm, setLoginForm] = useState({ email: "", password: "" });
+  const [step,setStep] = useState(0)
   const [registerForm, setRegisterForm] = useState({
     name: "",
     email: "",
