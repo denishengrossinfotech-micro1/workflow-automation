@@ -1,0 +1,267 @@
+name: Post-Merge Regression Guard
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: post-merge-regression-main
+  cancel-in-progress: false
+
+jobs:
+  regression:
+    if: >-
+      github.repository == 'denishengrossinfotech-micro1/workflow-automation' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      REGRESSION_BASE_URL: ${{ vars.REGRESSION_BASE_URL || 'http://127.0.0.1:4173' }}
+      REGRESSION_TEST_EMAIL: ${{ secrets.REGRESSION_TEST_EMAIL }}
+      REGRESSION_TEST_PASSWORD: ${{ secrets.REGRESSION_TEST_PASSWORD }}
+      REGRESSION_AUTH_URL_PATTERN: ${{ vars.REGRESSION_AUTH_URL_PATTERN || '(login|auth|session|token)' }}
+      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+      GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+
+    steps:
+      - name: Check out latest main only
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+
+      - name: Set up Node.js
+        id: setup_node
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          package-manager-cache: false
+
+      - name: Gather merge details and read the complete test document
+        id: prepare
+        if: steps.checkout.outcome == 'success' && steps.setup_node.outcome == 'success'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node .github/regression/post-merge.mjs prepare
+
+      - name: Restore the latest successful main baseline
+        id: baseline_restore
+        if: steps.prepare.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/restore@v6
+        with:
+          path: .regression-baseline
+          key: regression-baseline-main-${{ github.run_id }}
+          restore-keys: |
+            regression-baseline-main-
+
+      - name: Install application dependencies
+        id: dependencies
+        if: steps.prepare.outcome == 'success'
+        continue-on-error: true
+        run: npm ci
+
+      - name: Build application
+        id: build
+        if: steps.dependencies.outcome == 'success'
+        continue-on-error: true
+        run: npm run build
+
+      - name: Install Playwright and Chromium
+        id: playwright
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: |
+          npm install --no-save --package-lock=false @playwright/test@1.61.1
+          npx playwright install --with-deps chromium
+
+      - name: Start application and verify availability
+        id: start_app
+        if: steps.playwright.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [[ "$REGRESSION_BASE_URL" == http://127.0.0.1:* || "$REGRESSION_BASE_URL" == http://localhost:* ]]; then
+            nohup npm run preview -- --host 127.0.0.1 --port 4173 > artifacts/application.log 2>&1 &
+            echo $! > artifacts/application.pid
+          fi
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error --max-time 5 "$REGRESSION_BASE_URL" > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Application did not become available at $REGRESSION_BASE_URL" >&2
+          exit 1
+
+      - name: Run Playwright regression tests and reproduce failures
+        id: tests
+        if: steps.start_app.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          set -u
+          rm -f artifacts/playwright-results.json artifacts/playwright-first.json artifacts/playwright-rerun.json
+          npx playwright test --config=playwright.regression.config.mjs
+          first_exit=$?
+          if [[ ! -s artifacts/playwright-results.json ]]; then
+            echo "Playwright did not produce a JSON result; it could not run successfully." >&2
+            exit 1
+          fi
+          cp artifacts/playwright-results.json artifacts/playwright-first.json
+
+          if [[ $first_exit -ne 0 ]]; then
+            rm -f artifacts/playwright-results.json
+            npx playwright test --config=playwright.regression.config.mjs --last-failed
+            rerun_exit=$?
+            if [[ ! -s artifacts/playwright-results.json ]]; then
+              echo "Playwright did not produce a reproduction-run result." >&2
+              exit 1
+            fi
+            cp artifacts/playwright-results.json artifacts/playwright-rerun.json
+          else
+            rerun_exit=0
+            printf '{"suites":[]}\n' > artifacts/playwright-rerun.json
+          fi
+          printf '{"firstExitCode":%s,"rerunExitCode":%s}\n' "$first_exit" "$rerun_exit" > artifacts/playwright-exit-codes.json
+          exit 0
+
+      - name: Analyze impact, confirm regressions, and create report
+        id: analyze
+        if: steps.tests.outcome == 'success'
+        continue-on-error: true
+        run: node .github/regression/post-merge.mjs analyze
+
+      - name: Save successful main baseline
+        id: baseline_save
+        if: steps.analyze.outcome == 'success' && steps.analyze.outputs.healthy == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: .regression-baseline
+          key: regression-baseline-main-${{ github.run_id }}
+
+      - name: Email the merge author or fallback recipient
+        id: notify
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          STEP_CHECKOUT: ${{ steps.checkout.outcome }}
+          STEP_SETUP_NODE: ${{ steps.setup_node.outcome }}
+          STEP_PREPARE: ${{ steps.prepare.outcome }}
+          STEP_DEPENDENCIES: ${{ steps.dependencies.outcome }}
+          STEP_BUILD: ${{ steps.build.outcome }}
+          STEP_PLAYWRIGHT: ${{ steps.playwright.outcome }}
+          STEP_START_APP: ${{ steps.start_app.outcome }}
+          STEP_TESTS: ${{ steps.tests.outcome }}
+          STEP_ANALYZE: ${{ steps.analyze.outcome }}
+        shell: bash
+        run: |
+          if [[ -f .github/regression/post-merge.mjs ]]; then
+            node .github/regression/post-merge.mjs notify
+            exit $?
+          fi
+
+          # Checkout failures have no repository script, so use a minimal inline Gmail fallback.
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const fallback = 'denish.engrossinfotech@expert.micro1.ai';
+          const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+          let recipient = fallback;
+          const mergedBy = event.pull_request?.merged_by?.login;
+          if (mergedBy) {
+            try {
+              const profile = await fetch(`https://api.github.com/users/${encodeURIComponent(mergedBy)}`, {
+                headers: { Authorization: `Bearer ${process.env.GITHUB_TOKEN}`, Accept: 'application/vnd.github+json' },
+              }).then((response) => response.json());
+              if (profile.email && !/noreply|users\.noreply/i.test(profile.email)) recipient = profile.email;
+            } catch {}
+          }
+          for (const name of ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN']) {
+            if (!process.env[name]) throw new Error(`${name} is required to email the checkout-failure report.`);
+          }
+          const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+              client_id: process.env.GOOGLE_CLIENT_ID,
+              client_secret: process.env.GOOGLE_CLIENT_SECRET,
+              refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
+              grant_type: 'refresh_token',
+            }),
+          });
+          if (!tokenResponse.ok) throw new Error(`Google OAuth failed: ${tokenResponse.status}`);
+          const { access_token } = await tokenResponse.json();
+          const subject = 'Regression Detected After Merge';
+          const body = `Classification: INFRASTRUCTURE_OR_VALIDATION_FAILURE\n\nCheckout of the latest main branch failed. No application regression is claimed because Playwright could not run.\n\nRepository: ${process.env.GITHUB_REPOSITORY}\nPull request: #${event.pull_request?.number || 'unavailable'}\nMerge commit: ${event.pull_request?.merge_commit_sha || process.env.GITHUB_SHA}\nMerged by: ${mergedBy || 'unavailable'}\nRun: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}\n`;
+          const mime = `To: ${recipient}\r\nSubject: ${subject}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n${body}`;
+          const raw = Buffer.from(mime).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+          const sent = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ raw }),
+          });
+          if (!sent.ok) throw new Error(`Gmail send failed: ${sent.status} ${await sent.text()}`);
+          NODE
+
+      - name: Upload regression evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: post-merge-regression-${{ github.event.pull_request.number }}-${{ github.run_id }}
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce final workflow result
+        if: always()
+        shell: bash
+        env:
+          ANALYSIS_FAILURE: ${{ steps.analyze.outputs.workflow_failure }}
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          SETUP_NODE_OUTCOME: ${{ steps.setup_node.outcome }}
+          PREPARE_OUTCOME: ${{ steps.prepare.outcome }}
+          DEPENDENCIES_OUTCOME: ${{ steps.dependencies.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          PLAYWRIGHT_OUTCOME: ${{ steps.playwright.outcome }}
+          START_APP_OUTCOME: ${{ steps.start_app.outcome }}
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+          ANALYZE_OUTCOME: ${{ steps.analyze.outcome }}
+          NOTIFY_OUTCOME: ${{ steps.notify.outcome }}
+        run: |
+          set -euo pipefail
+          outcomes=(
+            "$CHECKOUT_OUTCOME" "$SETUP_NODE_OUTCOME" "$PREPARE_OUTCOME"
+            "$DEPENDENCIES_OUTCOME" "$BUILD_OUTCOME" "$PLAYWRIGHT_OUTCOME"
+            "$START_APP_OUTCOME" "$TESTS_OUTCOME" "$ANALYZE_OUTCOME" "$NOTIFY_OUTCOME"
+          )
+          for outcome in "${outcomes[@]}"; do
+            if [[ "$outcome" == "failure" ]]; then
+              echo "A critical validation or notification stage failed." >&2
+              exit 1
+            fi
+          done
+          if [[ "$ANALYSIS_FAILURE" == "true" ]]; then
+            echo "Post-merge validation did not pass." >&2
+            exit 1
+          fi
