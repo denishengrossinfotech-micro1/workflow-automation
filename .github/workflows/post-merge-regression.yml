@@ -120,7 +120,7 @@ jobs:
           set +e
           set -u
           rm -f artifacts/playwright-results.json artifacts/playwright-first.json artifacts/playwright-rerun.json
-          npx playwright test --config=playwright.regression.config.mjs
+          PW_RUN_LABEL=first npx playwright test --config=playwright.regression.config.mjs
           first_exit=$?
           if [[ ! -s artifacts/playwright-results.json ]]; then
             echo "Playwright did not produce a JSON result; it could not run successfully." >&2
@@ -130,7 +130,7 @@ jobs:
 
           if [[ $first_exit -ne 0 ]]; then
             rm -f artifacts/playwright-results.json
-            npx playwright test --config=playwright.regression.config.mjs --last-failed
+            PW_RUN_LABEL=rerun npx playwright test --config=playwright.regression.config.mjs
             rerun_exit=$?
             if [[ ! -s artifacts/playwright-results.json ]]; then
               echo "Playwright did not produce a reproduction-run result." >&2
