@@ -136,13 +136,24 @@ async function prepare() {
   if (!mergeSha) throw new Error('GitHub did not return a merge commit hash.');
   const commit = await github(`/repos/${repository}/commits/${mergeSha}`);
 
+  const changeAuthor = pr.user?.login || event.pull_request.user?.login || 'unknown';
   const mergedBy = pr.merged_by?.login || event.pull_request.merged_by?.login || 'unknown';
-  let publicProfile = null;
-  if (mergedBy !== 'unknown') {
-    try { publicProfile = await github(`/users/${encodeURIComponent(mergedBy)}`); } catch { publicProfile = null; }
+  let changeAuthorProfile = null;
+  let mergerProfile = null;
+  let headCommit = null;
+  if (changeAuthor !== 'unknown') {
+    try { changeAuthorProfile = await github(`/users/${encodeURIComponent(changeAuthor)}`); } catch { changeAuthorProfile = null; }
+  }
+  if (mergedBy !== 'unknown' && mergedBy !== changeAuthor) {
+    try { mergerProfile = await github(`/users/${encodeURIComponent(mergedBy)}`); } catch { mergerProfile = null; }
+  }
+  if (pr.head?.sha) {
+    try { headCommit = await github(`/repos/${repository}/commits/${pr.head.sha}`); } catch { headCommit = null; }
   }
   const candidateEmails = [
-    publicProfile?.email,
+    changeAuthorProfile?.email,
+    headCommit?.commit?.author?.email,
+    mergerProfile?.email,
     commit?.commit?.committer?.email,
     commit?.commit?.author?.email,
   ];
@@ -185,7 +196,7 @@ async function prepare() {
       authoredAt: commit.commit?.author?.date || null,
       committedAt: commit.commit?.committer?.date || null,
     },
-    recipient: { selected: recipient, mergeAuthorEmail, fallback: FALLBACK_RECIPIENT },
+    recipient: { selected: recipient, mergeAuthorEmail, intendedAuthor: changeAuthor, fallback: FALLBACK_RECIPIENT },
     changes: {
       totalFiles: normalizedFiles.length,
       added: byStatus('added'),
@@ -344,8 +355,14 @@ function analyze() {
   const baseline = readJson(path.join(baselineDir, 'baseline.json'), { passed: [], source: 'none' });
   const baselinePassed = new Set(baseline.passed || []);
   const failed = first.filter((test) => test.status !== 'passed' && test.status !== 'skipped');
-  const reproduced = failed.filter((test) => rerunMap.get(test.id)?.status !== 'passed');
+  const reproduced = failed.filter((test) => {
+    const rerunStatus = rerunMap.get(test.id)?.status;
+    return rerunStatus && rerunStatus !== 'passed' && rerunStatus !== 'skipped';
+  });
   const flaky = failed.filter((test) => rerunMap.get(test.id)?.status === 'passed');
+  const reproducedIds = new Set(reproduced.map((test) => test.id));
+  const flakyIds = new Set(flaky.map((test) => test.id));
+  const inconclusive = failed.filter((test) => !reproducedIds.has(test.id) && !flakyIds.has(test.id));
   const confirmed = reproduced.filter((test) => baselinePassed.has(test.id) && test.title.includes('@doc:TC-LOGIN-001'));
   const newOrUnbaselined = reproduced.filter((test) => !baselinePassed.has(test.id));
   const passed = first.filter((test) => test.status === 'passed');
@@ -356,8 +373,9 @@ function analyze() {
 
   let classification = 'HEALTHY';
   if (confirmed.length) classification = 'CONFIRMED_REGRESSION';
-  else if (flaky.length) classification = 'FLAKY_VALIDATION_FAILURE';
   else if (reproduced.length) classification = baselinePassed.size ? 'NON_BASELINE_TEST_FAILURE' : 'BASELINE_NOT_ESTABLISHED';
+  else if (flaky.length) classification = 'FLAKY_VALIDATION_FAILURE';
+  else if (inconclusive.length) classification = 'INCONCLUSIVE_REPRODUCTION';
 
   const severity = confirmed.some((test) => /valid credentials/.test(test.title)) ? 'Critical' : confirmed.length ? 'High' : reproduced.length ? 'Unconfirmed' : 'None';
   const risk = confirmed.length ? 'High risk to authentication availability and user access; production promotion should be blocked.' : reproduced.length ? 'Validation is not healthy, but regression criteria are incomplete; investigate before production.' : 'No confirmed regression found.';
@@ -379,6 +397,7 @@ function analyze() {
     failedTests: failed,
     reproducedTests: reproduced.map((test) => test.id),
     flakyTests: flaky.map((test) => test.id),
+    inconclusiveReproductionTests: inconclusive.map((test) => test.id),
     confirmedRegressions: confirmed.map((test) => test.id),
     newOrUnbaselinedFailures: newOrUnbaselined.map((test) => test.id),
     telemetry,
@@ -393,7 +412,7 @@ function analyze() {
   const failureRows = failed.map((test) => `| ${escapeTable(test.title)} | ${test.status} | ${rerunMap.get(test.id)?.status || 'not rerun'} | ${baselinePassed.has(test.id) ? 'yes' : 'no'} |`).join('\n') || '| None | — | — | — |';
   const probable = candidates.length ? candidates.map((item, index) => `${index + 1}. \`${item.file}\` — ${item.reasons.join('; ')} (score ${item.score})`).join('\n') : 'No changed file could be ranked from the available runtime evidence.';
   const breaks = reproduced.flatMap((test) => test.errors.map((error) => `- **${test.title}**: ${error.message.split('\n')[0]}${error.stack ? `\n\n  Runtime stack: \`${error.stack.split('\n')[0]}\`` : ''}`)).join('\n') || '- None';
-  const report = `# Post-Merge Regression Report\n\n## Classification\n\n**${classification}** — ${classification === 'CONFIRMED_REGRESSION' ? 'All regression gates were satisfied: previously passing, document mismatch, and reproducible.' : classification === 'HEALTHY' ? 'No automated test failure was detected.' : 'A validation failure occurred, but it must not be called a confirmed regression because one or more regression gates were not satisfied.'}\n\n## Merge Information\n\n- Repository: ${merge.repository.fullName}\n- Pull request: #${merge.pullRequest.number} — ${merge.pullRequest.title}\n- Source branch: ${merge.pullRequest.sourceBranch}\n- Target branch: ${merge.pullRequest.targetBranch}\n- Merge commit: ${merge.pullRequest.mergeCommitSha}\n- Merged by: ${merge.pullRequest.mergedBy}\n- Merged at: ${merge.pullRequest.mergedAt}\n- Pull request description: ${merge.pullRequest.description || '(empty)'}\n\n## Change Summary\n\n${merge.quickSummary}\n\n- Impacted features: ${merge.changes.impactedFeatures.join(', ') || 'not inferred'}\n- Dependency files: ${merge.changes.dependencyFiles.join(', ') || 'none'}\n- Configuration files: ${merge.changes.configurationFiles.join(', ') || 'none'}\n\n| Changed file | Status | Delta |\n|---|---:|---:|\n${changedRows}\n\n## Build Status\n\n- Overall validation: **${statusLabel}**\n- Application build: passed before Playwright execution\n- Test document: ${spec.document.title} (${spec.testCaseId}), completely read: ${spec.document.completelyRead}\n- Runtime base URL source: ${spec.runtime.baseUrlSource}\n- Credential source: ${spec.runtime.credentialsSource}\n\n## Test Summary\n\n- Total: ${first.length}\n- Passed: ${passed.length}\n- Failed: ${failed.length}\n- Skipped: ${skipped.length}\n- Duration: ${(durationMs / 1000).toFixed(2)} seconds\n- Reproduced failures: ${reproduced.length}\n- Flaky/non-reproduced failures: ${flaky.length}\n- Confirmed regressions: ${confirmed.length}\n\n| Test | First run | Reproduction run | Passed in previous successful baseline |\n|---|---:|---:|---:|\n${failureRows}\n\n## Runtime Telemetry\n\n- Browser console errors: ${telemetry.consoleErrors.length}\n- JavaScript exceptions: ${telemetry.javascriptExceptions.length}\n- Network connection failures: ${telemetry.requestFailures.length}\n- HTTP responses observed: ${telemetry.responses.length}\n- Main-frame navigations: ${telemetry.navigations.length}\n\n## Root Cause Analysis\n\n- Introducing merge commit: ${confirmed.length ? merge.pullRequest.mergeCommitSha : 'not assigned because regression gates were not all satisfied'}\n- Severity: ${severity}\n- Risk: ${risk}\n\n### Execution breakpoints\n\n${breaks}\n\n### Files to inspect first\n\n${probable}\n\n### Suggested fixes\n\n1. Reproduce the failing Playwright step locally in the same test environment and inspect the retained trace, screenshot, video, console, and response telemetry.\n2. Start with the ranked files above and restore the documented login request, response handling, navigation, validation message, and error-free console behavior.\n3. If dependencies or configuration changed, verify authentication endpoints, environment values, build-time variables, and version compatibility before changing application logic.\n4. Add or update focused automated coverage only when it remains faithful to ${spec.testCaseId}; do not weaken the documented assertions to make the build pass.\n`;
+  const report = `# Post-Merge Regression Report\n\n## Classification\n\n**${classification}** — ${classification === 'CONFIRMED_REGRESSION' ? 'All regression gates were satisfied: previously passing, document mismatch, and reproducible.' : classification === 'HEALTHY' ? 'No automated test failure was detected.' : 'A validation failure occurred, but it must not be called a confirmed regression because one or more regression gates were not satisfied.'}\n\n## Merge Information\n\n- Repository: ${merge.repository.fullName}\n- Pull request: #${merge.pullRequest.number} — ${merge.pullRequest.title}\n- Source branch: ${merge.pullRequest.sourceBranch}\n- Target branch: ${merge.pullRequest.targetBranch}\n- Merge commit: ${merge.pullRequest.mergeCommitSha}\n- Merged by: ${merge.pullRequest.mergedBy}\n- Merged at: ${merge.pullRequest.mergedAt}\n- Pull request description: ${merge.pullRequest.description || '(empty)'}\n\n## Change Summary\n\n${merge.quickSummary}\n\n- Impacted features: ${merge.changes.impactedFeatures.join(', ') || 'not inferred'}\n- Dependency files: ${merge.changes.dependencyFiles.join(', ') || 'none'}\n- Configuration files: ${merge.changes.configurationFiles.join(', ') || 'none'}\n\n| Changed file | Status | Delta |\n|---|---:|---:|\n${changedRows}\n\n## Build Status\n\n- Overall validation: **${statusLabel}**\n- Application build: passed before Playwright execution\n- Test document: ${spec.document.title} (${spec.testCaseId}), completely read: ${spec.document.completelyRead}\n- Runtime base URL source: ${spec.runtime.baseUrlSource}\n- Credential source: ${spec.runtime.credentialsSource}\n\n## Test Summary\n\n- Total: ${first.length}\n- Passed: ${passed.length}\n- Failed: ${failed.length}\n- Skipped: ${skipped.length}\n- Duration: ${(durationMs / 1000).toFixed(2)} seconds\n- Reproduced failures: ${reproduced.length}\n- Flaky/non-reproduced failures: ${flaky.length}\n- Inconclusive reproduction results: ${inconclusive.length}\n- Confirmed regressions: ${confirmed.length}\n\n| Test | First run | Reproduction run | Passed in previous successful baseline |\n|---|---:|---:|---:|\n${failureRows}\n\n## Runtime Telemetry\n\n- Browser console errors: ${telemetry.consoleErrors.length}\n- JavaScript exceptions: ${telemetry.javascriptExceptions.length}\n- Network connection failures: ${telemetry.requestFailures.length}\n- HTTP responses observed: ${telemetry.responses.length}\n- Main-frame navigations: ${telemetry.navigations.length}\n\n## Root Cause Analysis\n\n- Introducing merge commit: ${confirmed.length ? merge.pullRequest.mergeCommitSha : 'not assigned because regression gates were not all satisfied'}\n- Severity: ${severity}\n- Risk: ${risk}\n\n### Execution breakpoints\n\n${breaks}\n\n### Files to inspect first\n\n${probable}\n\n### Suggested fixes\n\n1. Reproduce the failing Playwright step locally in the same test environment and inspect the retained trace, screenshot, video, console, and response telemetry.\n2. Start with the ranked files above and restore the documented login request, response handling, navigation, validation message, and error-free console behavior.\n3. If dependencies or configuration changed, verify authentication endpoints, environment values, build-time variables, and version compatibility before changing application logic.\n4. Add or update focused automated coverage only when it remains faithful to ${spec.testCaseId}; do not weaken the documented assertions to make the build pass.\n`;
   fs.writeFileSync(jsonPath('regression-report.md'), report);
   appendSummary(`\n${report}`);
 
@@ -464,7 +483,33 @@ async function notify() {
     return;
   }
   const merge = readJson(jsonPath('merge-details.json'));
-  const recipient = merge?.recipient?.selected || FALLBACK_RECIPIENT;
+  let recipient = merge?.recipient?.selected || FALLBACK_RECIPIENT;
+  if (!merge) {
+    try {
+      const event = readJson(required('GITHUB_EVENT_PATH'));
+      const repository = event?.repository?.full_name || process.env.GITHUB_REPOSITORY;
+      const number = event?.pull_request?.number;
+      if (repository === EXPECTED_REPOSITORY && number) {
+        const pr = await github(`/repos/${repository}/pulls/${number}`);
+        const changeAuthor = pr.user?.login;
+        const mergedBy = pr.merged_by?.login;
+        const profiles = [];
+        for (const login of [...new Set([changeAuthor, mergedBy].filter(Boolean))]) {
+          try { profiles.push(await github(`/users/${encodeURIComponent(login)}`)); } catch {}
+        }
+        let headCommit = null;
+        if (pr.head?.sha) {
+          try { headCommit = await github(`/repos/${repository}/commits/${pr.head.sha}`); } catch {}
+        }
+        const discovered = [
+          profiles.find((profile) => profile.login === changeAuthor)?.email,
+          headCommit?.commit?.author?.email,
+          profiles.find((profile) => profile.login === mergedBy)?.email,
+        ].find(validHumanEmail);
+        if (discovered) recipient = discovered;
+      }
+    } catch {}
+  }
   const body = `Classification: ${classification}\n\n${report}\n\nGitHub Actions run: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}\n`;
   const message = await sendGmail(recipient, body);
   writeJson('notification.json', { sent: true, recipient, subject: SUBJECT, classification, gmailMessageId: message.id, sentAt: new Date().toISOString() });
