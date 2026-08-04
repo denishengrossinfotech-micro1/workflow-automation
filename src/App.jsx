@@ -162,7 +162,7 @@ function App() {
         {view === "register" && (
           <section className="card">
             <h2>Register</h2>
-            <form onSubmit={register}>
+            <form>
               <label>
                 Name
                 <input
