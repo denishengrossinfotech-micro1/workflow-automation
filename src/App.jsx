@@ -120,7 +120,7 @@ function App() {
         {view === "login" && (
           <section className="card">
             <h2>Login</h2>
-            <form onSubmit={login}>
+            <form>
               <label>
                 Email
                 <input
